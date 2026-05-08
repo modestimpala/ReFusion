@@ -52,6 +52,10 @@ unsafe fn run(my_module: HMODULE) {
     }
 
     let real = my_dir.join(REAL_UE4SS_NAME);
+    if let Err(e) = ensure_real_ue4ss(&real) {
+        error!("could not stage real ue4ss: {e:#}");
+        return;
+    }
     info!("loading real ue4ss from {:?}", real);
     let wide = match U16CString::from_os_str(real.as_os_str()) {
         Ok(w) => w,
@@ -197,6 +201,43 @@ unsafe fn module_dir(module: HMODULE) -> Option<PathBuf> {
 
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
+}
+
+/// Stage `ue4ss_real.dll` next to the wrapper by copying `<profile>/ue4ss.dll`
+/// over it on every launch. The wrapper's `GetModuleFileNameW` returns the
+/// spoofed `<install>/.../Binaries/Win64` path (shimloader virtualizes file
+/// access there), so we can't derive the profile from it. We use
+/// `SHIMLOADER_OVERLAY_DIR` instead, which shimloader sets to the real
+/// `<profile>/shimloader/overlay` path before our DllMain runs. Re-copying
+/// every launch keeps the staged DLL in sync after the user updates UE4SS.
+///
+/// The destination can stay `my_dir`-relative because shimloader's overlay
+/// registry redirects writes under the spoofed Win64 path back to the real
+/// overlay dir.
+fn ensure_real_ue4ss(dest: &Path) -> anyhow::Result<()> {
+    let overlay_dir = std::env::var_os("SHIMLOADER_OVERLAY_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("SHIMLOADER_OVERLAY_DIR not set"))?;
+    // SHIMLOADER_OVERLAY_DIR is `<profile>/shimloader/overlay`; profile is two up.
+    let profile = overlay_dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "can't derive profile root from SHIMLOADER_OVERLAY_DIR={:?}",
+                overlay_dir
+            )
+        })?;
+    let src = profile.join("ue4ss.dll");
+    if !src.is_file() {
+        return Err(anyhow::anyhow!(
+            "real ue4ss source {:?} not found",
+            src
+        ));
+    }
+    info!("staging real ue4ss: {:?} -> {:?}", src, dest);
+    std::fs::copy(&src, dest)?;
+    Ok(())
 }
 
 fn log_env() {
