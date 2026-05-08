@@ -1,0 +1,9 @@
+/target
+*.pdb
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
