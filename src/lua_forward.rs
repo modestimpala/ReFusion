@@ -77,9 +77,8 @@ pub unsafe extern "C" fn set_script_variable_default_data(
     external_data: Opaque,
     return_value: Opaque,
 ) {
-    static F: OnceLock<
-        Option<unsafe extern "C" fn(*const c_char, *const c_char, Opaque, Opaque)>,
-    > = OnceLock::new();
+    static F: OnceLock<Option<unsafe extern "C" fn(*const c_char, *const c_char, Opaque, Opaque)>> =
+        OnceLock::new();
     if let Some(f) = resolve(&F, b"set_script_variable_default_data\0") {
         f(mod_name, variable_name, external_data, return_value);
     }
@@ -92,11 +91,15 @@ pub unsafe extern "C" fn call_script_function(
     return_value: Opaque,
     script_func_return_value: Opaque,
 ) {
-    static F: OnceLock<
-        Option<unsafe extern "C" fn(*const c_char, *const c_char, Opaque, Opaque)>,
-    > = OnceLock::new();
+    static F: OnceLock<Option<unsafe extern "C" fn(*const c_char, *const c_char, Opaque, Opaque)>> =
+        OnceLock::new();
     if let Some(f) = resolve(&F, b"call_script_function\0") {
-        f(mod_name, function_name, return_value, script_func_return_value);
+        f(
+            mod_name,
+            function_name,
+            return_value,
+            script_func_return_value,
+        );
     }
 }
 
