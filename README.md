@@ -5,34 +5,38 @@ shimloader overlay wrapper. Replaces the standalone two-step C# launcher.
 
 ## How it works
 
-- Built as `ue4ss.dll`. Ships in a shimloader overlay package so shimloader's
-  `LoadLibraryW("Win64/ue4ss.dll")` resolves to this wrapper instead of the
-  real ue4ss.
-- Wrapper's `DllMain` reads the `SHIMLOADER_*` env vars to discover where the user's mods, paks, and configs
-  live.
-- Runs the fusion pipeline: extract the shipped datatable templates and
-  `DefaultInput.ini` from the game pak, extract mod paks, merge the mod
-  datatables into the templates, merge `DefaultInput.ini` files, write
-  `FusionPatch_P.pak` into the user's pak directory.
-- Resolves every pak entry against its pak's mount point before filtering.
-  UnrealPak records the folder the author packed, so the same file is
-  `_Content/main/datatables/_list_props.uasset` in one mod pak and bare
-  `_list_props.uasset` in another; matching on entry paths alone silently drops
-  the deeply-mounted ones.
-- Places the bundled Oodle runtime next to the game executable first, because
-  mod paks are Oodle-compressed. See [Bundled Oodle runtime](#bundled-oodle-runtime).
-- Copies `<profile>/ue4ss.dll` over `<my_dir>/ue4ss_real.dll` on every
-  launch so the staged DLL never goes stale relative to the user's UE4SS
-  install. The profile root is derived from `SHIMLOADER_OVERLAY_DIR`
-  (whose value is `<profile>/shimloader/overlay`); we can't use the
-  wrapper's own module path because shimloader spoofs that to look like a
-  Win64 binary path.
-- Then `LoadLibraryW("ue4ss_real.dll")` to hand off to the real UE4SS.
+- Ships as `ue4ss.dll` in a shimloader overlay, so
+  `LoadLibraryW("Win64/ue4ss.dll")` loads this wrapper first.
+- `DllMain` reads the `SHIMLOADER_*` environment variables, places the bundled
+  Oodle runtime next to the game executable, and runs the merge before the game
+  initializes. See [Bundled Oodle runtime](#bundled-oodle-runtime).
+- The merge extracts the game's datatable templates and `DefaultInput.ini`,
+  merges in mod content, and writes `FusionPatch_P.pak` to the user's pak
+  directory.
+- Pak entries are resolved against their mount points before filtering, since
+  the same asset may be stored under a full `_Content/...` path or as a bare
+  filename depending on how the mod was packed.
+- On every launch, the wrapper derives `<profile>` from
+  `SHIMLOADER_OVERLAY_DIR`, copies `<profile>/ue4ss.dll` to
+  `<my_dir>/ue4ss_real.dll`, then loads it to hand off to the real UE4SS. This
+  keeps the staged DLL current and avoids shimloader's spoofed module path.
+
+## Why this exists
+
+This exists to address problems that I think are either unsolvable from the classic Lua/C++ mod approach or inherent to Fusion itself:
+
+  1. **Pak access depends on game filesystem locks.** Any Fusion datatable merge has to run while the game is closed and be finished before it launches.
+    The original C# Fusion mod relied on a Lua script to launch an executable, which then killed the game process to release the file lock, ran the datatable and asset merges, created the pak, and relaunched the game. That means an *extra* game process launch every time the datatables have to be re-fused.
+    This only happens when paks are changed or added, but it is still unnecessary overhead. Fusion also can't close the game until its Lua mod initializes, which can mean several seconds of waiting depending on the environment.
+    This mod bypasses that entirely by pretending to *be* UE4SS at first. The normal path is Game Executable Launch -> Shimloader -> UE4SS -> Actual UE Game Initialization. We're inserted after shimloader and before UE4SS, so all pak operations finish before the game has any idea those paks even exist.
+  2. **Non-ASCII paths, filenames, and incompatible mods.** The original Fusion mod would silently fail on non-English paths and mods that no longer line up with the game's current structs.
+    This version supports a wide variety of text encodings and visibly warns players about incompatible mods while continuing to merge the ones that do work.
+  3. **General performance and resulting pak size.** The original mod runs several `repak` processes per pak, and the result is often several MB for just a few small datatables. This version includes Oodle support and built-in optimizations, making a cold merge over 4x faster and producing an output pak about 82% smaller in the measurements below.
+
 
 ## Install layout
 
-The wrapper is shipped as an overlay package. End users never assemble this
-by hand - a Thunderstore/r2modman package would lay it out:
+The wrapper is shipped as an overlay package. 
 
 ```
 <profile>/
@@ -40,18 +44,18 @@ by hand - a Thunderstore/r2modman package would lay it out:
 ├── shimloader/cfg/
 │   └── FusionWrapper.ini         (optional; see "Mods built for another game version")
 └── shimloader/overlay/FusionWrapper/
-    ├── ue4ss.dll                 (this crate's build output, renamed)
+    ├── ue4ss.dll                 (this repo's build output, renamed)
     ├── Mods/NynrahGhost-Fusion/
     │   └── .shim-removed         (masks the C# Fusion's Lua mod; see below)
     └── fusion/
         └── oo2core_9_win64.dll   (Oodle runtime, see below)
 ```
 
-`register_overlay_dir` mirrors each overlay package onto
-`<install>/<Project>/Binaries/Win64`, registering one mapping **per file** -
-directories are only walked, never redirected wholesale. So those two files are
-the whole package, and everything the wrapper writes at a `my_dir`-relative path
-that the overlay does not claim lands in the real game directory:
+Shimloader mirrors the overlay package onto
+`<install>/<Project>/Binaries/Win64`, mapping each file individually rather
+than redirecting whole directories. Anything the wrapper writes to a
+`my_dir`-relative path not claimed by the overlay therefore lands in the real
+game directory:
 
 ```
 <install>/<Project>/Binaries/Win64/
@@ -63,70 +67,42 @@ that the overlay does not claim lands in the real game directory:
     └── last-write.txt            (input mtimes, skips redundant merges)
 ```
 
-And the launch params gain `--overlay-dir "<profile>/shimloader/overlay"`.
+And the launch params gain `--overlay-dir "<profile>/shimloader/overlay"` (set by r2modman, etc).
 
 ## Coexisting with the C# Fusion
 
-Installing both is the normal case, not user error: item mods list
-`NynrahGhost-Fusion` as a Thunderstore dependency, so r2modman installs the C#
-tool for anyone who installs one of them. Its `Fusion.exe` writes
-`<pak_dir>/NynrahGhost-Fusion/FusionPatch_P.pak`, and shimloader maps the whole
-pak directory onto `<game>/Content/Paks/LogicMods`, so both patch paks mount
-with the same entry paths. Which one the engine serves is a pak-precedence
-detail, and the loser is discarded silently - so a stale C# merge can quietly
-replace a correct one (or vice versa) with no visible symptom beyond missing or
-outdated rows.
+This is both a drop-in replacement for the C# Fusion and a standalone one. New
+mods can depend on this package alone, but many existing mods still depend on
+`NynrahGhost-Fusion`, so mod managers will often install both side by side.
+That is expected, not user error.
 
-Two layers stop that, upstream and downstream.
+Both tools write a `FusionPatch_P.pak` containing the same entry paths. If both
+outputs mount, pak precedence decides which one wins, and a stale merge can
+silently replace the correct one. The wrapper prevents that at two points.
 
-**Upstream - keep the C# tool from running at all.** It is a UE4SS Lua mod:
-UE4SS loads `Mods/NynrahGhost-Fusion/scripts/main.lua`, which writes a `run.bat`
-and `io.popen`s it to start `Fusion.exe`. The overlay package therefore ships an
-empty marker file:
+**Upstream - stop the C# tool from running.** The overlay ships this empty
+marker:
 
 ```
 shimloader/overlay/FusionWrapper/Mods/NynrahGhost-Fusion/.shim-removed
 ```
 
-`register_overlay_subtree` turns a `.shim-removed` tombstone into a path mask on
-the logical `Binaries/Win64/Mods/NynrahGhost-Fusion`, and every file detour
-(`CreateFileW`, `NtCreateFile`, `FindFirstFileW`/`FindNextFileW`,
-`GetFileAttributes*`) consults `is_masked` before remapping. UE4SS never sees the
-folder, so the Lua never loads. Nothing in the user's profile is touched;
-removing the overlay package restores the tool. Keep the tombstone one level
-*inside* `Mods/` - a tombstone directly in `Mods/` would mask the whole user mod
-directory, which shimloader's own tests call out.
+Shimloader treats `.shim-removed` as a tombstone, hiding the C# Fusion mod from
+UE4SS so its Lua launcher never runs. The real installation is untouched;
+removing this overlay makes it visible again. The marker must stay inside
+`Mods/NynrahGhost-Fusion` - placing it directly inside `Mods` would hide every
+user mod. `report_rival_tool` logs whether the C# tool is installed and whether
+the mask is working.
 
-Replacing `Fusion.exe` with a do-nothing stub does **not** work, incidentally:
-`main.lua` recovers the real profile paths by parsing `shimloader-log.txt` rather
-than using the virtual `Mods/` path, and shimloader hooks no process-creation
-API, so the child process never touches the overlay.
+**Downstream - disable stale merged paks.** `pak::classify` identifies merged
+outputs by their contents rather than their filenames, then renames rivals to
+`*.pak.disabled-by-fusion-wrapper`. The files remain visible and reversible but
+no longer mount.
 
-`report_rival_tool` checks both facts at every launch and logs which case
-applies - installed via the real `SHIMLOADER_MOD_DIR` path, visible via the
-logical one - because the tombstone is a packaging artifact the DLL cannot
-create for itself: shimloader scans the overlay before the wrapper is loaded.
-
-**Downstream - make sure only one merged pak is mounted.** Needed regardless,
-since a pak from an earlier launch (or from running the tool outside the game)
-is already on disk:
-
-- `pak::classify` tags every pak in the pak directory from its index. Tables at
-  the game's own `Content/main/datatables/` paths mean an already-merged output;
-  mod content always lives at `Content/Mods/<mod>/_Content/...`. Name-independent,
-  so a renamed or older output is still recognised, and content-thresholded (5+
-  tables, or tables next to merged `Config/*.ini`) so an ordinary
-  asset-replacement mod is not mistaken for one.
-- Rival merged paks are renamed to `*.pak.disabled-by-fusion-wrapper`. UE only
-  mounts `*.pak`, so the file goes inert while staying visible and reversible -
-  drop the suffix to restore it. If the C# tool runs again and rewrites its pak,
-  the next launch disables it again.
-- Quarantine happens only once the result is known good: after our own pak is
-  written, or on a cache hit where it already exists, or when there is nothing
-  to merge at all. If any stage fails, rival paks are left mounted - a stale
-  merge beats no merge.
-- When the last mod is uninstalled, our own output is deleted too, so leftover
-  rows can't outlive the mods that supplied them.
+This only happens after our result is known good: after a successful write, on
+a valid cache hit, or when there is nothing to merge. If the merge fails, rival
+paks remain mounted because a stale merge is better than no merge. When the last
+mod is removed, our own output is deleted as well.
 
 To go back to the C# tool, remove the overlay wrapper and drop the
 `.disabled-by-fusion-wrapper` suffix.
@@ -135,32 +111,27 @@ To go back to the C# tool, remove the overlay wrapper and drop the
 
 Blueprint struct members serialize with a GUID suffix
 (`price_27_397ABECF466FF5CA25FEBCBD300108FB`). Re-adding a member in the editor
-changes that GUID, so a mod authored against an older row struct emits tags the
-engine cannot match: the field falls back to its default and the item shows up
-with no name, icon or mesh. Nothing errors - which is why the C# tool merged
-such mods silently and the result read as "the loader is broken".
+changes that GUID. Mods built against the old struct then write fields the game
+cannot match, causing values such as names, icons, and meshes to fall back to
+defaults without raising an error.
 
-So the merge shape-checks first. `datatable::fuse_datatables` flattens the
-template's first row into `column path -> type signatures` (recursing through
-nested structs, and describing containers by their first element since length is
-data, not shape) and sorts each mod column into one of three buckets:
+The wrapper catches this by comparing each mod table's shape against the current
+game template:
 
-- **Rebuilt or retyped** - the game still has a member of that base name, under
-  a different `_<ordinal>_<GUID>` suffix or with a different type. The mod's
-  value goes nowhere and the field defaults. Breaking.
-- **Gone** - the game has no member of that name at all. The engine ignores the
-  tag and the rest of the row still applies. Logged, not breaking.
-- **Missing from the mod** - a field the game added later, filled from the struct
-  default. Not reported.
+- **Rebuilt or retyped fields** have the same base name but a different GUID or
+  type. Their values cannot apply, so they are breaking.
+- **Removed fields** no longer exist in the game. They are ignored by the engine
+  and logged, but are not breaking.
+- **New game fields** missing from the mod use their defaults and are not
+  reported.
 
 A mod with any breaking column is dropped from **every** table, not just the
-failing one: its tables cross-reference each other by row name (a store row
-names a prop row), so a half-merged mod is worse than an absent one. Every other
-mod merges normally.
+failing one. Its tables may cross-reference each other, so a partial merge is
+worse than leaving the mod out. Compatible mods still merge normally.
 
-That default is deliberately blunt, and real mods land on both sides of it - one
-may lose only a spare flag while another loses its meshes and display names. So
-`FusionWrapper.ini` in the config folder can let specific mods through:
+That default is deliberately blunt: a mismatch may be an unused flag or
+something essential. Specific mods can be forced through with
+`FusionWrapper.ini`:
 
 ```ini
 # names are pak file stems, exactly as they appear in the log
@@ -169,93 +140,60 @@ merge_incompatible=CraftableWhiteMushrooms, SomeOtherMod
 ```
 
 Editing it invalidates the merge cache, so the change takes effect on the next
-launch. Mods let through are still reported, flagged as merged anyway.
+launch. Forced mods are still reported as incompatible but marked as merged.
 
-On Windows the report becomes a message box (`win::warn_incompatible_mods`)
-naming each mod, its verdict, and the first few mismatching columns, because this
-is the one failure a log file cannot surface: the game otherwise starts up
-looking fine. The wording is built by `left_out_report` in the portable
-half, so `cargo run --example fusiontool -- fuse ...` prints the exact dialog
-text. It only appears when the merge actually runs - a cache hit skips
-validation - so it shows up on the first launch after the mod set changes.
+On Windows, a message box names each incompatible mod, whether it was skipped or
+forced, and its first few mismatched columns. It appears when validation runs,
+usually on the first launch after the mod set changes; cache hits skip it.
 
 ## Text encodings and non-ASCII paths
 
-None of this pipeline assumes ASCII or UTF-8, which matters because a large part
-of this game's audience is Russian-speaking.
+The pipeline does not assume ASCII or UTF-8. Non-Latin paths, filenames, and mod
+content are supported throughout.
 
 **Asset content.** Row keys are FNames and item names/descriptions are FStrings.
-`unreal_asset` stores an FString wide (UTF-16, negative length prefix) as soon as
-it holds a non-ASCII character and narrow otherwise, and the FName hash it writes
-follows the same split - which is what UE itself does. Verified by round-trip:
-`fusiontool roundtrip <uasset>` parses an asset and serializes it straight back,
-and the game's own `list_props` (642 KB, 2477 rows, 9694 name-map entries)
-reproduces **byte-identically**, hashes included. A merge that injects a Cyrillic
-row key plus Cyrillic display name, description and string column
-(`fusiontool translate`) also round-trips byte-identically. The game's shipped
-tables already contain non-ASCII text (typographic quotes and dashes in item
-descriptions), so this path is exercised by every merge.
+`unreal_asset` writes non-ASCII strings as UTF-16 and produces the same FName
+hashes as UE. This was verified by round-tripping the game's 642 KB `list_props`
+table **byte-identically**, then repeating the test with Cyrillic row keys and
+text injected by `fusiontool translate`.
 
 **Paths.** Install directory, mod pak names, mod folders and profile names may all
-be non-ASCII; verified end-to-end on Windows with the whole tree under Cyrillic
-directories and a pak named `Тест Мод №1.pak`. `module_dir` converts the module
-path with `OsString::from_wide` rather than through a lossy `String`, and grows
-its buffer instead of truncating at `MAX_PATH` - truncation there would silently
-yield a *wrong* directory and misplace every subsequent read and write.
+be non-ASCII. This was verified end to end on Windows with the entire tree under
+Cyrillic directories and a pak named `Тест Мод №1.pak`. Module paths stay as
+native wide strings, and the path buffer grows beyond `MAX_PATH` instead of
+silently truncating.
 
-**Config and ini files.** These come from other people's editors, so `text::read`
-honours a UTF-8, UTF-16LE or UTF-16BE BOM, detects BOM-less UTF-16 from NUL
-placement, and otherwise decodes UTF-8 leniently (a bad byte becomes U+FFFD
-rather than failing the file, matching what the C# tool's `File.ReadAllText`
-does). This is not hypothetical: PowerShell 5.1's `>` writes UTF-16LE, so
-`"merge_incompatible=..." > FusionWrapper.ini` produced a config that
-`read_to_string` rejected and which was therefore silently ignored.
-
-The user's `Input.ini` is *appended to*, and the engine rewrites that file as
-UTF-16 the moment it holds a non-ANSI character - a Cyrillic action name is
-enough. Appended lines are re-encoded to match what was already there, because
-appending UTF-8 to a UTF-16 file would leave the user with a config the engine
-reads as garbage.
+**Config and ini files.** `text::read` handles UTF-8, UTF-16LE, and UTF-16BE,
+with or without a BOM, and replaces invalid UTF-8 bytes rather than rejecting
+the file. This also supports UTF-16 configs produced by Windows PowerShell 5.1.
+When appending to the user's `Input.ini`, new lines are encoded to match the
+existing file so UTF-8 is never mixed into a UTF-16 config.
 
 ## Failure handling
 
-The guiding rule is that a mod either merges completely or not at all, and that
-nothing silently does nothing:
+Mods either merge completely or are visibly left out:
 
 - **Damaged mod file.** A `.uasset`/`.uexp` that won't parse drops that mod from
-  every table and is reported in the dialog, for the same cross-reference reason
-  as a struct mismatch. `merge_incompatible` does not override this - it is about
-  struct drift, not corruption.
-- **Interrupted pack.** The output pak is built under a per-process
-  `.pak.<pid>.partial` name and renamed into place, so a run that dies partway -
-  out of disk, permissions, killed process - can't leave a truncated pak for the
-  engine to mount. UE only mounts `*.pak`, so a leftover partial is inert.
-- **Nothing to merge.** A mod table whose name matches no game table, and a
-  `.uasset` in a `datatables` folder without the `_` merge-source prefix, are both
-  logged - each looks identical to a broken merge from the outside.
-- **Duplicate row keys.** The engine's row map is keyed by name, so a repeated key
-  makes one row unreachable; deliberate when a mod replaces a vanilla item, a
-  silent conflict when two mods collide. Logged either way.
-- **Unreadable mod pak.** A pak whose index won't parse (damaged download, or a
-  missing Oodle runtime, which takes out every mod at once) is named in the log
-  and the dialog, and the run is **not cached** so the next launch retries -
-  a file locked by an antivirus scan or a still-running mod manager fixes itself.
-- **Cache.** Keyed on path, mtime *and size* of every input, because swapping a
-  mod for another build of itself can reproduce the mtime exactly (r2modman and
-  backup restores both preserve timestamps).
-- **Repeat reports.** The dialog only interrupts startup when its text differs
-  from the last one shown (`fusion/reported.txt`). Without that, an unreadable
-  pak - which deliberately defeats the cache - would pop a modal on every single
-  launch until it was fixed. The log still records it every time.
+  every table and reports it. `merge_incompatible` cannot override corruption.
+- **Interrupted pack.** Output is written as `.pak.<pid>.partial` and renamed
+  only when complete. Leftover partials do not mount.
+- **Nothing to merge.** Unmatched tables and datatable assets without the `_`
+  merge-source prefix are logged rather than silently ignored.
+- **Duplicate row keys.** Vanilla replacements and conflicts between mods are
+  both logged.
+- **Unreadable mod pak.** Damaged, locked, or Oodle-compressed paks that cannot
+  be read are reported. The run is not cached, so the next launch retries.
+- **Cache.** Inputs are keyed by path, modification time, and size, covering mod
+  updates that preserve timestamps.
+- **Repeat reports.** A dialog appears only when its text changes, avoiding the
+  same modal on every retry. The log still records every failure.
 
 ## Bundled Oodle runtime
 
-Mod paks for this game can be Oodle-compressed, so `repak` needs `oo2core`.
-`repak`'s `oodle_loader` looks for the library next to the running executable
-and, when it is missing, downloads it from GitHub - inside `DllMain`, at game
-launch. Thunderstore doesn't allow runtime download and executing of binaries, 
-so the overlay ships the library and `src/oodle.rs` copies it to the path the 
-loader probes before any pak is opened.
+Oodle-compressed mod paks require `oo2core`. Normally, `repak` downloads the
+runtime when it is missing, but doing that inside `DllMain` at game launch is
+not suitable for Thunderstore. The overlay bundles it instead, and the wrapper
+places it next to the game executable before opening any paks.
 
 Fetch it once when building the package:
 
@@ -263,55 +201,40 @@ Fetch it once when building the package:
 curl -Lo oo2core_9_win64.dll https://github.com/WorkingRobot/OodleUE/raw/refs/heads/main/Engine/Source/Programs/Shared/EpicGames.Oodle/Sdk/2.9.10/win/redist/oo2core_9_win64.dll
 sha256sum oo2core_9_win64.dll   # 6f5d41a7892ea6b2db420f2458dad2f84a63901c9a93ce9497337b16c195f457
 ```
-That is the same file, version and hash `oodle_loader` would have downloaded.
+That is the same file, version and hash `oodle_loader` would have downloaded at the time of this commit. 
 Without it the wrapper still runs, logs an error, and skips every
-Oodle-compressed mod pak - the datatables in those mods silently go missing.
+Oodle-compressed mod pak. 
 
 ## Performance
 
-Measured on the same inputs (VotV a09n, SmartTV + SlotMachine, 34 templates out
-of an 8 GB game pak), release build, median of three runs. "Cold" is a full
-merge; "warm" is an unchanged mod set:
+Release build, median of three runs using VotV a09n, SmartTV + SlotMachine, and
+34 templates from an 8 GB game pak:
 
 | | C# Fusion | this wrapper |
 |---|---|---|
-| cold merge | 1425 ms | 321 ms |
-| warm launch | 213 ms | 19 ms (~4 ms in-process) |
-| output pak | 4,475,500 B | 801,122 B |
+| cold merge | 1425 ms | 321 ms (77% faster) |
+| warm launch | 213 ms | 19 ms (91% faster; ~4 ms in-process) |
+| output pak | 4,475,500 B | 801,122 B (82% smaller) |
 | processes spawned | `repak.exe` per pak + pack, then **relaunches the game** | none |
 
-The C# tool's cost is structural rather than sloppy: it shells out to
-`repak.exe` for every extract and for the pack (`Utils.cs`), packs without
-compression, and `Utils.LaunchGame()` writes a `pass` marker and starts a second
-game process, so any change to the mod set costs a full second game startup on
-top of the merge. Running in-process removes that entirely.
+The C# tool starts `repak.exe` for every extraction and pack, writes an
+uncompressed output, then relaunches the game. Running the pipeline in-process
+removes that overhead.
 
-Two things dominated our own cold time before they were fixed, both worth
-knowing if this code is extended:
+Cold performance also depends on buffered asset I/O and incremental name-map
+updates. Reading and writing through `Cursor<Vec<u8>>` reduced the largest
+table's parse/write time from 1229/3552 ms to 36/9 ms, while `rekey_into` avoids
+rebuilding the entire destination name map for every mod.
 
-- **Unbuffered asset I/O.** `unreal_asset` reads and writes in primitive-sized
-  steps, so passing it a `File` made `list_props` (2477 rows, 642 KB + 1.4 MB)
-  take 1229 ms to parse and 3552 ms to write. Parsing from and serializing into
-  a `Cursor<Vec<u8>>` took those to 36 ms and 9 ms.
-- **Whole-asset name-map rebuilds.** `Asset::rebuild_name_map` re-examines every
-  FName in the destination table once per merged mod. `rekey_into` re-keys only
-  the rows and imports that actually moved, which is proportional to the mod
-  rather than to the game's table.
-
-`fuse` logs a stage breakdown (`timings ms: templates=… datatables=… pack=…`)
-and `merge_one` logs per-table `parse/merge/write`, so a regression here shows up
-in the log without re-instrumenting.
+The log includes stage and per-table timings so regressions are visible without
+additional instrumentation.
 
 ## Prerequisites
 
-- Rust stable with the `x86_64-pc-windows-msvc` target. `rust-toolchain.toml`
-  and `.cargo/config.toml` already pin both, so `rustup` will fetch what's
-  needed on first build.
-- A working MSVC toolchain (Visual Studio Build Tools with the C++ workload,
-  or equivalent) so the `windows-msvc` target can link.
-- A sibling checkout of [`repak`](https://github.com/trumank/repak) at
-  `../repak` relative to this crate - `Cargo.toml` resolves `repak` via a
-  path dependency. Adjust the path there if your layout differs.
+- Rust stable and `x86_64-pc-windows-msvc`, both pinned by the repo.
+- An MSVC C++ toolchain for linking.
+- A [`repak`](https://github.com/trumank/repak) checkout at `../repak`, or an
+  adjusted path in `Cargo.toml`.
 
 ## Build
 
@@ -323,31 +246,24 @@ Produces `target/x86_64-pc-windows-msvc/release/ue4ss.dll`.
 
 ### `REAL_UE4SS_PATH` (build-time)
 
-`build.rs` reads the `REAL_UE4SS_PATH` env var at compile time, parses the
-PE at that path, and emits a `.def` file that statically forwards every
-C++-mangled export to `ue4ss_real.dll`. Without it the wrapper still
-builds, but UE4SS C++ mods that link against UE4SS exports will fail to
-load. Set it to the path of a real `ue4ss.dll` whose ABI matches the one
-end users will run, e.g.:
+Set `REAL_UE4SS_PATH` to an ABI-compatible real `ue4ss.dll` when building:
 
 ```
 REAL_UE4SS_PATH=/path/to/ue4ss.dll cargo build --release
 ```
 
-It only affects the build: end users never set this, and the wrapper
-doesn't read it at runtime.
+`build.rs` uses it to generate a `.def` that forwards the real DLL's C++ exports
+to `ue4ss_real.dll`. The wrapper builds without it, **but UE4SS C++ mods cannot
+link through the wrapper**. End users do not set this variable.
 
-A `.def` file replaces the whole export table, so UE4SS's plain `extern "C"`
-Lua API symbols would otherwise disappear from the wrapper. `build.rs` lists
-them in the `.def` without a forwarding target, which exports the runtime
-forwarders in `src/lua_forward.rs` instead; the built DLL should have 6 plain
-exports alongside the mangled forwarders. Any `extern "C"` export in the real
-DLL that has no forwarder there produces a build warning.
+The six plain C Lua API exports are implemented by `src/lua_forward.rs` rather
+than forwarded statically. Any unsupported plain export produces a build
+warning.
 
 ## Offline verification
 
-The pipeline is target-independent (only `src/win.rs` and `src/lua_forward.rs`
-need Windows), so it can be run and diffed without launching the game:
+The merge pipeline is cross-platform, so it can be tested without launching the
+game:
 
 ```
 # whole pipeline, exactly as DllMain runs it
@@ -355,27 +271,20 @@ SHIMLOADER_PAK_DIR=<profile>/shimloader/pak SHIMLOADER_CFG_DIR=<profile>/shimloa
   cargo run --target x86_64-unknown-linux-gnu --example fusiontool -- \
   fuse <fake-install>/<Project>/Binaries/Win64
 
-# merge in place into a directory of templates, then read a table back
+# merge extracted assets, inspect a table, or verify a byte-identical round trip
 cargo run --target x86_64-unknown-linux-gnu --example fusiontool -- merge <staged_dir> <extracted_mod_dir>...
 cargo run --target x86_64-unknown-linux-gnu --example fusiontool -- dump <uasset>
-
-# serialization fidelity: parse an asset, write it back, compare bytes
 cargo run --target x86_64-unknown-linux-gnu --example fusiontool -- roundtrip <uasset>
 ```
 
-`dump` prints every row with resolved FName contents, instance numbers, and
-import targets, which is what makes cross-checking possible: dump the merged
-table and the same table out of the C# Fusion's `FusionPatch_P.pak`, sort, and
-diff. Row order depends on mod processing order, so compare sorted.
+`dump` resolves FNames and imports for comparison with the C# Fusion output.
+Sort before diffing because row order depends on mod processing order.
 
-Two commands exist to manufacture conditions that are otherwise hard to obtain:
-`skew <uasset> <column-substring> <new-name>` rewrites a column name in a real
-asset, reproducing the GUID drift of a mod built against an older game version,
-and `translate <uasset> <text>` rewrites a row key and its text values, standing
-in for a mod authored in a non-Latin language. Both operate on a copy you point
-them at.
+`skew <uasset> <column-substring> <new-name>` simulates struct GUID drift, while
+`translate <uasset> <text>` replaces a row key and its text values for non-Latin
+content testing. Both modify only the file provided.
 
 ## Status
 
-`FuseDatatables` and `FuseInputs` only - the dead-code `FuseActors` and
-`ReplacementMod` paths from the C# version are intentionally not ported.
+Feature parity with the C# Fusion for datatable and input merging. The unused
+`FuseActors` and `ReplacementMod` paths were intentionally not ported.
