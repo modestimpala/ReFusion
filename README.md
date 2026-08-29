@@ -94,7 +94,7 @@ The wrapper is shipped as an overlay package.
 ├── ue4ss.dll                     (the real UE4SS, installed normally)
 ├── shimloader/cfg/
 │   └── ReFusion.ini         (optional; see "Mods built for another game version")
-└── shimloader/overlay/ReFusion/
+└── shimloader/overlay/<Author>-ReFusion/     (folder named by the mod manager)
     ├── ue4ss.dll                 (this repo's build output, renamed)
     ├── Mods/NynrahGhost-Fusion/
     │   └── .shim-removed         (masks the C# Fusion's Lua mod; see below)
@@ -170,44 +170,19 @@ To go back to the C# tool, remove the overlay wrapper and drop the
 ## Mods built against a different struct
 
 Blueprint struct members serialize with an ordinal and GUID suffix
-(`price_27_397ABECF466FF5CA25FEBCBD300108FB`). Both are minted once, when the
-member is created in the editor, so a mod built against the game's own struct
-carries the game's spelling, while a mod whose author rebuilt or hand-wrote the
-struct carries its own. The engine matches tagged properties by that whole
-mangled name (`UStruct::SerializeTaggedProperties`), so a member whose suffix
-differs is not matched at all: names, icons, and meshes silently fall back to
-defaults with no error. The engine's own GUID-based redirect cannot help, because
-it keys on the member GUID, which is exactly what differs.
+(`price_27_397ABECF466FF5CA25FEBCBD300108FB`). A rebuilt or hand-written struct
+may use a different suffix, causing the engine to silently ignore that field.
 
-ReFusion compares each mod table against the game's current struct and sorts
-every column into one of three outcomes:
-
-- **Drifted.** Same base name, same serialized type, one unambiguous match in the
-  game's struct. The merge rewrites the tag to the game's spelling, so the mod's
-  value arrives. This is what makes a hand-written struct work, and it is
-  logged per table with a count of what was rewritten.
-- **Breaking.** The type changed, or the name matches several members and no
-  rename can be proven. The value cannot be delivered.
-- **Removed.** The game has no such member. The engine ignores the tag and the
-  rest of the row still loads, so this is logged but not breaking.
+ReFusion compares mod columns with the game's current structs. An unambiguous
+match with the same base name and type is rewritten to the game's spelling;
+retyped or ambiguous fields are breaking, while fields removed from the game
+are only logged.
 
 A mod with any breaking column is dropped from **every** table, not just the
-failing one. Its tables may cross-reference each other, so a partial merge is
-worse than leaving the mod out. Compatible mods still merge normally.
+failing one, because its tables may cross-reference each other. Compatible mods
+continue to merge normally.
 
-Drift is matched per column path, pooled across every table, because these
-structs are shared and only partly populated: no `list_equipment` row fills in
-the nested save-data struct that other tables do, so its members can only be
-learned elsewhere.
-
-One case is deliberately left alone. An empty `Array<StructProperty>` cannot be
-renamed consistently: `unreal_asset` writes its inner tag from a private field
-and reads that tag back over the property's name, so a rename would produce a
-file that contradicts itself. Nothing is lost, because an unmatched array member
-defaults to empty, which is what it already was.
-
-That breaking default is deliberately blunt: a mismatch may be an unused flag or
-something essential. Specific mods can be forced through with `ReFusion.ini`:
+Specific mods can be forced through with `ReFusion.ini`:
 
 ```ini
 # names are pak file stems, exactly as they appear in the log
@@ -215,12 +190,8 @@ merge_incompatible=CraftableWhiteMushrooms, SomeOtherMod
 # or: merge_incompatible=all
 ```
 
-Editing it invalidates the merge cache, so the change takes effect on the next
-launch. Forced mods are still reported as incompatible but marked as merged.
-
-On Windows, a message box names each incompatible mod, whether it was skipped or
-forced, and its first few mismatched columns. It only appears when the report
-differs from the last one shown.
+The change applies on the next launch. A Windows message box reports skipped or
+forced mods and their first few mismatches, but only when the report changes.
 
 ## Text encodings and non-ASCII paths
 
