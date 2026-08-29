@@ -1,7 +1,7 @@
 //! Tolerant text file reading.
 //!
 //! Every text file this wrapper reads is authored by someone else - mod
-//! `DefaultInput.ini` files, the user's `FusionWrapper.ini`, and the user's own
+//! `DefaultInput.ini` files, the user's `ReFusion.ini`, and the user's own
 //! `Input.ini` written by the engine. On Windows those arrive in whatever
 //! encoding the producer felt like:
 //!
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn utf8_bom_is_stripped() {
-        // A surviving BOM lands in the first key, so `FusionWrapper.ini` written
+        // A surviving BOM lands in the first key, so `ReFusion.ini` written
         // by a BOM-emitting editor parses as an unknown key and is ignored.
         let mut bytes = vec![0xEF, 0xBB, 0xBF];
         bytes.extend_from_slice(b"merge_incompatible=all");

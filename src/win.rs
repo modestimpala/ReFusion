@@ -48,7 +48,7 @@ unsafe fn run(my_module: HMODULE) {
 
     init_logger(&my_dir);
 
-    info!("fusion-wrapper start, my_dir={:?}", my_dir);
+    info!("ReFusion start, my_dir={:?}", my_dir);
     log_env();
 
     match crate::fuse(&my_dir) {
@@ -101,8 +101,8 @@ unsafe fn warn_left_out(outcome: &crate::FuseOutcome) {
     }
 
     let caption = match outcome.unreadable_paks.is_empty() {
-        true => "Fusion: incompatible mods skipped",
-        false => "Fusion: mod paks could not be read",
+        true => "ReFusion: incompatible mods skipped",
+        false => "ReFusion: mod paks could not be read",
     };
     let (Ok(text), Ok(caption)) = (U16CString::from_str(&body), U16CString::from_str(caption))
     else {
@@ -189,7 +189,7 @@ fn log_env() {
 }
 
 fn init_logger(my_dir: &Path) {
-    let log_path = my_dir.join("fusion-wrapper-log.txt");
+    let log_path = my_dir.join("refusion-log.txt");
     let Ok(file) = File::create(&log_path) else {
         return;
     };

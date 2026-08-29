@@ -1,4 +1,8 @@
-# fusion-wrapper
+# ReFusion
+
+<div align="center">
+    <img src="./thunderstore/icon_full.png" alt="Project Screenshot" width="200">
+</div>
 
 In-process port of [NynrahGhost's Fusion](https://github.com/NynrahGhost/Fusion) datatable/input merger, packaged as a
 shimloader overlay wrapper. Replaces the standalone two-step C# launcher.
@@ -23,15 +27,45 @@ shimloader overlay wrapper. Replaces the standalone two-step C# launcher.
 
 ## Why this exists
 
-This exists to address problems that I think are either unsolvable from the classic Lua/C++ mod approach or inherent to Fusion itself:
+This exists to address problems that I think are either unsolvable from the
+classic Lua/C++ mod approach or inherent to Fusion itself.
 
-  1. **Pak access depends on game filesystem locks.** Any Fusion datatable merge has to run while the game is closed and be finished before it launches.
-    The original C# Fusion mod relied on a Lua script to launch an executable, which then killed the game process to release the file lock, ran the datatable and asset merges, created the pak, and relaunched the game. That means an *extra* game process launch every time the datatables have to be re-fused.
-    This only happens when paks are changed or added, but it is still unnecessary overhead. Fusion also can't close the game until its Lua mod initializes, which can mean several seconds of waiting depending on the environment.
-    This mod bypasses that entirely by pretending to *be* UE4SS at first. The normal path is Game Executable Launch -> Shimloader -> UE4SS -> Actual UE Game Initialization. We're inserted after shimloader and before UE4SS, so all pak operations finish before the game has any idea those paks even exist.
-  2. **Non-ASCII paths, filenames, and incompatible mods.** The original Fusion mod would silently fail on non-English paths and mods that no longer line up with the game's current structs.
-    This version supports a wide variety of text encodings and visibly warns players about incompatible mods while continuing to merge the ones that do work.
-  3. **General performance and resulting pak size.** The original mod runs several `repak` processes per pak, and the result is often several MB for just a few small datatables. This version includes Oodle support and built-in optimizations, making a cold merge over 4x faster and producing an output pak about 82% smaller in the measurements below.
+### No extra game launch
+
+Pak access depends on game filesystem locks, so any Fusion datatable merge has
+to run while the game is closed and finish before it launches.
+
+The original C# Fusion mod relied on a Lua script to launch an executable. That
+executable killed the game process to release the file lock, ran the datatable
+and asset merges, created the pak, and relaunched the game. That means an
+*extra* game process launch every time the datatables have to be re-fused.
+
+This only happens when paks are changed or added, but it is still unnecessary
+overhead. Fusion also cannot close the game until its Lua mod initializes,
+which can mean several seconds of waiting depending on the environment.
+
+This mod bypasses that entirely by pretending to *be* UE4SS at first. The
+normal path is Game Executable Launch -> Shimloader -> UE4SS -> Actual UE Game
+Initialization. We're inserted after shimloader and before UE4SS, so all pak
+operations finish before the game has any idea those paks even exist.
+
+### Visible compatibility failures
+
+The original Fusion mod would silently fail on non-English paths and mods that
+no longer line up with the game's current structs. This version supports a wide
+variety of text encodings and visibly warns players about incompatible mods
+while continuing to merge the ones that do work.
+
+### Less overhead and smaller paks
+
+The entire pipeline stays in Rust from extraction through packing. It never has
+to cross into Lua or game code, so it can use the Rust-native `unreal_asset` and
+`repak` crates directly and keep all the work in-process.
+
+The original mod runs several `repak` processes per pak, and the result is often
+several MB for just a few small datatables. This version includes Oodle support
+and built-in optimizations, making a cold merge over 4x faster and producing an
+output pak about 82% smaller in the measurements below.
 
 
 ## Install layout
@@ -42,8 +76,8 @@ The wrapper is shipped as an overlay package.
 <profile>/
 ├── ue4ss.dll                     (the real UE4SS, installed normally)
 ├── shimloader/cfg/
-│   └── FusionWrapper.ini         (optional; see "Mods built for another game version")
-└── shimloader/overlay/FusionWrapper/
+│   └── ReFusion.ini         (optional; see "Mods built for another game version")
+└── shimloader/overlay/ReFusion/
     ├── ue4ss.dll                 (this repo's build output, renamed)
     ├── Mods/NynrahGhost-Fusion/
     │   └── .shim-removed         (masks the C# Fusion's Lua mod; see below)
@@ -61,7 +95,7 @@ game directory:
 <install>/<Project>/Binaries/Win64/
 ├── ue4ss_real.dll                (re-copied each launch from <profile>/ue4ss.dll)
 ├── oo2core_9_win64.dll           (placed from the overlay copy, where repak looks)
-├── fusion-wrapper-log.txt
+├── refusion-log.txt
 └── fusion/
     ├── work/                     (extracted paks + merge staging)
     └── last-write.txt            (input mtimes, skips redundant merges)
@@ -84,7 +118,7 @@ silently replace the correct one. The wrapper prevents that at two points.
 marker:
 
 ```
-shimloader/overlay/FusionWrapper/Mods/NynrahGhost-Fusion/.shim-removed
+shimloader/overlay/ReFusion/Mods/NynrahGhost-Fusion/.shim-removed
 ```
 
 Shimloader treats `.shim-removed` as a tombstone, hiding the C# Fusion mod from
@@ -96,7 +130,7 @@ the mask is working.
 
 **Downstream - disable stale merged paks.** `pak::classify` identifies merged
 outputs by their contents rather than their filenames, then renames rivals to
-`*.pak.disabled-by-fusion-wrapper`. The files remain visible and reversible but
+`*.pak.disabled-by-refusion`. The files remain visible and reversible but
 no longer mount.
 
 This only happens after our result is known good: after a successful write, on
@@ -105,33 +139,49 @@ paks remain mounted because a stale merge is better than no merge. When the last
 mod is removed, our own output is deleted as well.
 
 To go back to the C# tool, remove the overlay wrapper and drop the
-`.disabled-by-fusion-wrapper` suffix.
+`.disabled-by-refusion` suffix.
 
-## Mods built for another game version
+## Mods built against a different struct
 
-Blueprint struct members serialize with a GUID suffix
-(`price_27_397ABECF466FF5CA25FEBCBD300108FB`). Re-adding a member in the editor
-changes that GUID. Mods built against the old struct then write fields the game
-cannot match, causing values such as names, icons, and meshes to fall back to
-defaults without raising an error.
+Blueprint struct members serialize with an ordinal and GUID suffix
+(`price_27_397ABECF466FF5CA25FEBCBD300108FB`). Both are minted once, when the
+member is created in the editor, so a mod built against the game's own struct
+carries the game's spelling, while a mod whose author rebuilt or hand-wrote the
+struct carries its own. The engine matches tagged properties by that whole
+mangled name (`UStruct::SerializeTaggedProperties`), so a member whose suffix
+differs is not matched at all: names, icons, and meshes silently fall back to
+defaults with no error. The engine's own GUID-based redirect cannot help, because
+it keys on the member GUID, which is exactly what differs.
 
-The wrapper catches this by comparing each mod table's shape against the current
-game template:
+ReFusion compares each mod table against the game's current struct and sorts
+every column into one of three outcomes:
 
-- **Rebuilt or retyped fields** have the same base name but a different GUID or
-  type. Their values cannot apply, so they are breaking.
-- **Removed fields** no longer exist in the game. They are ignored by the engine
-  and logged, but are not breaking.
-- **New game fields** missing from the mod use their defaults and are not
-  reported.
+- **Drifted.** Same base name, same serialized type, one unambiguous match in the
+  game's struct. The merge rewrites the tag to the game's spelling, so the mod's
+  value arrives. This is what makes a hand-written struct work, and it is
+  logged per table with a count of what was rewritten.
+- **Breaking.** The type changed, or the name matches several members and no
+  rename can be proven. The value cannot be delivered.
+- **Removed.** The game has no such member. The engine ignores the tag and the
+  rest of the row still loads, so this is logged but not breaking.
 
 A mod with any breaking column is dropped from **every** table, not just the
 failing one. Its tables may cross-reference each other, so a partial merge is
 worse than leaving the mod out. Compatible mods still merge normally.
 
-That default is deliberately blunt: a mismatch may be an unused flag or
-something essential. Specific mods can be forced through with
-`FusionWrapper.ini`:
+Drift is matched per column path, pooled across every table, because these
+structs are shared and only partly populated: no `list_equipment` row fills in
+the nested save-data struct that other tables do, so its members can only be
+learned elsewhere.
+
+One case is deliberately left alone. An empty `Array<StructProperty>` cannot be
+renamed consistently: `unreal_asset` writes its inner tag from a private field
+and reads that tag back over the property's name, so a rename would produce a
+file that contradicts itself. Nothing is lost, because an unmatched array member
+defaults to empty, which is what it already was.
+
+That breaking default is deliberately blunt: a mismatch may be an unused flag or
+something essential. Specific mods can be forced through with `ReFusion.ini`:
 
 ```ini
 # names are pak file stems, exactly as they appear in the log
@@ -143,8 +193,8 @@ Editing it invalidates the merge cache, so the change takes effect on the next
 launch. Forced mods are still reported as incompatible but marked as merged.
 
 On Windows, a message box names each incompatible mod, whether it was skipped or
-forced, and its first few mismatched columns. It appears when validation runs,
-usually on the first launch after the mod set changes; cache hits skip it.
+forced, and its first few mismatched columns. It only appears when the report
+differs from the last one shown.
 
 ## Text encodings and non-ASCII paths
 

@@ -9,7 +9,9 @@ use unreal_asset::{
     containers::shared_resource::SharedResource,
     engine_version::EngineVersion,
     exports::Export,
-    properties::{struct_property::StructProperty, Property, PropertyDataTrait},
+    properties::{
+        array_property::ArrayProperty, struct_property::StructProperty, Property, PropertyDataTrait,
+    },
     types::{
         fname::{FName, FNameContainer, ToSerializedName},
         PackageIndex,
@@ -60,6 +62,16 @@ impl OnIncompatible {
 /// the name of the mod pak each came from.
 type ModFiles = std::collections::HashMap<String, Vec<(String, PathBuf)>>;
 
+/// Mod-side datatable assets, split by whether they can merge at all.
+struct ModTables {
+    /// Assets named `_Foo.uasset`, keyed by the `Foo` they merge into.
+    sources: ModFiles,
+    /// Assets in a datatables folder without the leading underscore, keyed by
+    /// their stem. Most are a mod's own private tables; one named after a game
+    /// table replaces that asset wholesale instead of merging into it.
+    plain: ModFiles,
+}
+
 /// Merge every mod's rows into the game's tables, in place under `staged_dir`.
 ///
 /// A mod file is `_Foo.uasset` against the game's `Foo.uasset`; the leading
@@ -83,28 +95,29 @@ pub fn fuse_datatables(
         .map(|e| e.path())
         .filter(|p| crate::walk::has_extension(p, "uasset"))
         .collect();
-    let mod_files = index_mod_files(extracted_dirs);
-    warn_unmatched_tables(&templates, &mod_files);
+    let mod_tables = index_mod_files(extracted_dirs);
+    warn_unusable_tables(&templates, &mod_tables);
 
-    let check = shape_check(&templates, &mod_files, on_incompatible);
+    let shapes = GameShapes::learn(&templates);
+    let check = shape_check(&mod_tables.sources, &shapes, on_incompatible);
 
     for template in &templates {
         let Some(stem) = template.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        let Some(mod_paths) = mod_files.get(stem) else {
+        let Some(mod_paths) = mod_tables.sources.get(stem) else {
             debug!("no mod overrides for template {stem}");
             continue;
         };
-        let usable: Vec<PathBuf> = mod_paths
+        let usable: Vec<(String, PathBuf)> = mod_paths
             .iter()
             .filter(|(mod_name, _)| !check.rejected.contains(mod_name))
-            .map(|(_, path)| path.clone())
+            .cloned()
             .collect();
         if usable.is_empty() {
             continue;
         }
-        if let Err(e) = merge_one(template, &usable) {
+        if let Err(e) = merge_one(template, &usable, &shapes) {
             warn!("merge failed for {stem}: {e:#}");
         }
     }
@@ -113,36 +126,65 @@ pub fn fuse_datatables(
     Ok(check.incompatible)
 }
 
-/// Group every mod's datatable assets by the game table they override.
-fn index_mod_files(extracted_dirs: &[(String, PathBuf)]) -> ModFiles {
-    let mut out = ModFiles::new();
+/// Group every mod's datatable assets by the game table they name.
+fn index_mod_files(extracted_dirs: &[(String, PathBuf)]) -> ModTables {
+    let mut out = ModTables {
+        sources: ModFiles::new(),
+        plain: ModFiles::new(),
+    };
     for (mod_name, dir) in extracted_dirs {
         for path in find_datatable_uassets(dir) {
             let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let stem = file_name.strip_prefix('_').unwrap_or(file_name).to_string();
-            out.entry(stem).or_default().push((mod_name.clone(), path));
+            let (bucket, stem) = match file_name.strip_prefix('_') {
+                Some(stem) => (&mut out.sources, stem),
+                None => (&mut out.plain, file_name),
+            };
+            bucket
+                .entry(stem.to_string())
+                .or_default()
+                .push((mod_name.clone(), path));
         }
     }
     out
 }
 
-/// A mod table whose name matches nothing the game ships contributes nothing,
-/// and from the outside looks exactly like a mod that failed to merge. Usually a
-/// typo, or a table renamed by a game update.
-fn warn_unmatched_tables(templates: &[PathBuf], mod_files: &ModFiles) {
+/// Warn about mod tables that cannot do what their name suggests.
+///
+/// Both cases look from the outside exactly like a merge that failed, and
+/// neither is visible in the game:
+///
+/// - `_Foo.uasset` where the game ships no `Foo`: a typo, or a table renamed by
+///   a game update.
+/// - `Foo.uasset` where the game *does* ship `Foo`: without the underscore it
+///   replaces the whole table rather than merging into it, and our merged pak
+///   will shadow it. A mod's own private tables land here too, which is why only
+///   names the game also uses are worth mentioning.
+fn warn_unusable_tables(templates: &[PathBuf], mod_tables: &ModTables) {
     let template_stems: std::collections::HashSet<&str> = templates
         .iter()
         .filter_map(|t| t.file_stem().and_then(|s| s.to_str()))
         .collect();
-    for (stem, sources) in mod_files {
+    for (stem, sources) in &mod_tables.sources {
         if template_stems.contains(stem.as_str()) {
             continue;
         }
         for (mod_name, path) in sources {
             warn!(
                 "{mod_name}: no game table named {stem:?} - {:?} will not be merged",
+                path.file_name().unwrap_or_default()
+            );
+        }
+    }
+    for (stem, sources) in &mod_tables.plain {
+        if !template_stems.contains(stem.as_str()) {
+            continue;
+        }
+        for (mod_name, path) in sources {
+            warn!(
+                "{mod_name}: {:?} replaces the whole {stem} table instead of merging into it \
+                 (a merge source is named _{stem}.uasset); our merged table will shadow it",
                 path.file_name().unwrap_or_default()
             );
         }
@@ -163,38 +205,21 @@ struct ShapeCheck {
 /// reference each other by row name (a store row names a prop row), so a
 /// half-merged mod is worse than an absent one.
 fn shape_check(
-    templates: &[PathBuf],
     mod_files: &ModFiles,
+    shapes: &GameShapes,
     on_incompatible: &OnIncompatible,
 ) -> ShapeCheck {
     let started = std::time::Instant::now();
     let mut incompatible: Vec<IncompatibleMod> = Vec::new();
     let mut rejected: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for template in templates {
-        let Some(stem) = template.file_stem().and_then(|s| s.to_str()) else {
+    for (stem, mod_paths) in mod_files {
+        let Some(template_shape) = shapes.tables.get(stem) else {
             continue;
-        };
-        let Some(mod_paths) = mod_files.get(stem) else {
-            continue;
-        };
-
-        let template_shape = match template_shape(template) {
-            Ok(Some(shape)) => shape,
-            // An empty table teaches nothing about the struct, so there is
-            // nothing to check against.
-            Ok(None) => {
-                debug!("template {stem} has no rows; skipping shape check");
-                continue;
-            }
-            Err(e) => {
-                warn!("cannot read template {stem} for shape check: {e:#}");
-                continue;
-            }
         };
 
         for (mod_name, path) in mod_paths {
-            let issues = match mod_issues(path, &template_shape) {
+            let issues = match mod_issues(path, template_shape, shapes) {
                 Ok(issues) => issues,
                 // A damaged file is not struct drift, so `merge_incompatible`
                 // does not apply: there is nothing to merge either way, and
@@ -215,6 +240,15 @@ fn shape_check(
                     continue;
                 }
             };
+            if !issues.drifted.is_empty() {
+                // The merge remaps these, so the mod's values arrive; the count
+                // it reports is the authority on what was actually rewritten,
+                // since an empty struct array is left as authored.
+                info!(
+                    "mod {mod_name}: {stem} member tag(s) named differently in this version: {}",
+                    issues.drifted.join("; ")
+                );
+            }
             if !issues.ignored.is_empty() {
                 // The mod predates a field removal. Harmless, but worth a trail
                 // when someone is working out why a value has no effect.
@@ -273,29 +307,130 @@ fn file_label(path: &Path) -> String {
 /// let a mismatched duplicate hide behind a matching one.
 type Shape = std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
 
-/// Template row struct, indexed both exactly and by member base name.
+/// One table's row struct, indexed both exactly and by member base name.
 struct TemplateShape {
     /// `column path -> type signatures`, as serialized.
     exact: Shape,
     /// `base column path -> exact paths`, i.e. member names with the ordinal and
-    /// GUID suffix stripped. Lets a rebuilt member be told apart from a member
-    /// the game no longer has at all.
+    /// GUID suffix stripped. Lets a member whose suffix merely drifted be told
+    /// apart from one the game no longer has at all.
     by_base: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
 }
 
-/// Shape of the template's first row, or `None` when the table is empty.
-fn template_shape(template: &Path) -> Result<Option<TemplateShape>> {
+/// Every row struct the game ships, plus how it spells each member.
+pub struct GameShapes {
+    /// Table stem -> that table's shape.
+    tables: std::collections::HashMap<String, TemplateShape>,
+    /// `(base column path, type signature) -> the game's spelling`, pooled
+    /// across every table, or `None` where tables disagree.
+    ///
+    /// Needed because these structs are shared and only partly populated: no
+    /// `list_equipment` row fills in the nested save-data struct that other
+    /// tables do, so a mod's tags for it cannot be checked against
+    /// `list_equipment` alone. Pooling is safe only where every table that has
+    /// the member spells it the same way, hence the `None`.
+    pooled: std::collections::HashMap<(String, String), Option<String>>,
+}
+
+impl GameShapes {
+    /// Learn every template's shape once, up front.
+    ///
+    /// From *all* rows, not just the first: optional containers are empty in
+    /// most rows, and an empty container serializes no tags for its contents.
+    pub fn learn(templates: &[PathBuf]) -> Self {
+        let mut shapes = GameShapes {
+            tables: std::collections::HashMap::new(),
+            pooled: std::collections::HashMap::new(),
+        };
+        for template in templates {
+            let Some(stem) = template.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            match table_shape(template) {
+                Ok(Some(shape)) => {
+                    shapes.pool(&shape);
+                    shapes.tables.insert(stem.to_string(), shape);
+                }
+                Ok(None) => debug!("template {stem} has no rows; nothing to learn from it"),
+                Err(e) => warn!("cannot read template {stem}: {e:#}"),
+            }
+        }
+        shapes
+    }
+
+    fn pool(&mut self, shape: &TemplateShape) {
+        for (column, signatures) in &shape.exact {
+            let base = base_path(column);
+            let name = last_segment(column).to_string();
+            for signature in signatures {
+                match self.pooled.entry((base.clone(), signature.clone())) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(Some(name.clone()));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        if slot.get().as_deref() != Some(name.as_str()) {
+                            slot.insert(None);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The game's own spelling of a member the mod spells differently, when that
+    /// is unambiguous.
+    ///
+    /// The member's own table decides whenever it knows the path at all; the
+    /// pooled index only answers for paths that table never populates. Both
+    /// require the base name and the serialized type to agree and exactly one
+    /// candidate to survive: with two same-named members of the same type there
+    /// is no way to tell which one the mod meant, and a changed type means the
+    /// value could not be delivered anyway.
+    fn drifted_name<'a>(
+        &'a self,
+        table: &'a TemplateShape,
+        base: &str,
+        signature: &str,
+    ) -> Option<&'a str> {
+        match table.by_base.get(base) {
+            Some(candidates) => {
+                let mut matching = candidates.iter().filter(|path| {
+                    table
+                        .exact
+                        .get(*path)
+                        .is_some_and(|sigs| sigs.contains(signature))
+                });
+                let only = matching.next()?;
+                match matching.next() {
+                    None => Some(last_segment(only)),
+                    Some(_) => None,
+                }
+            }
+            None => self
+                .pooled
+                .get(&(base.to_string(), signature.to_string()))?
+                .as_deref(),
+        }
+    }
+}
+
+/// Shape of a template on disk, or `None` when the table has no rows: there is
+/// no struct to learn, so nothing can be checked or remapped against it.
+fn table_shape(template: &Path) -> Result<Option<TemplateShape>> {
     let asset = open_asset(template, &template.with_extension("uexp"))?;
     let idx = find_data_table_export(&asset)
         .ok_or_else(|| anyhow::anyhow!("template has no DataTableExport"))?;
     let Some(table) = cast!(Export, DataTableExport, &asset.asset_data.exports[idx]) else {
         return Err(anyhow::anyhow!("template export not a DataTableExport"));
     };
-    let Some(first) = table.table.data.first() else {
+    if table.table.data.is_empty() {
         return Ok(None);
-    };
+    }
 
-    let exact = row_shape(first);
+    let mut exact = Shape::new();
+    for row in &table.table.data {
+        collect_shape(&row.value, "", &mut exact);
+    }
     let mut by_base: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
     for column in exact.keys() {
@@ -310,9 +445,15 @@ fn template_shape(template: &Path) -> Result<Option<TemplateShape>> {
 /// How a mod's rows disagree with the game's current row struct.
 #[derive(Default)]
 struct ModIssues {
-    /// Values the game will never receive: the member was rebuilt or retyped,
-    /// so the mod's tag doesn't match and the field takes its default.
+    /// Values the game will never receive: the type changed, or the name is
+    /// ambiguous, so the mod's tag cannot be matched to a member and the field
+    /// takes its default. This is what turns a stale mod into nameless,
+    /// meshless items.
     lost: Vec<String>,
+    /// Members whose suffix drifted but whose name and type still identify one
+    /// member of the game's struct. The merge renames these, so the value
+    /// arrives; they are logged only to explain why a mod needed rewriting.
+    drifted: Vec<String>,
     /// Tags for members this version of the game doesn't have at all. The
     /// engine ignores them and the rest of the row still loads, so these are
     /// reported but not disqualifying.
@@ -321,16 +462,20 @@ struct ModIssues {
 
 /// Compare `path`'s rows against the game's row struct.
 ///
-/// Blueprint struct members serialize as `<name>_<ordinal>_<GUID>`, and both the
-/// ordinal and the GUID change when the member is re-added in the editor. So
-/// there are two very different mismatches, and they need different verdicts:
+/// Blueprint struct members serialize as `<name>_<ordinal>_<GUID>`, and the
+/// engine matches a row's tags against that whole mangled name. Both the ordinal
+/// and the GUID are assigned by the editor, so they differ between the game's
+/// struct and any struct an author rebuilt or hand-wrote, even when the member
+/// is meant to be the same one. Three outcomes follow, and they need different
+/// verdicts:
 ///
-/// - The game still has a member of that name under a different suffix, or the
-///   type changed: the mod's value silently goes nowhere and the field defaults.
-///   That is what turns a stale mod into nameless, meshless items.
+/// - Name and type still identify exactly one of the game's members: the tag is
+///   stale but the intent is unambiguous, so the merge rewrites it.
+/// - The type changed, or the name matches several members: the value cannot be
+///   delivered and the field silently defaults.
 /// - The game has no such member at all: the field was removed, the engine
 ///   ignores the tag, and everything else in the row still applies.
-fn mod_issues(path: &Path, template: &TemplateShape) -> Result<ModIssues> {
+fn mod_issues(path: &Path, table_shape: &TemplateShape, shapes: &GameShapes) -> Result<ModIssues> {
     const MAX_REPORTED: usize = 4;
 
     let asset = open_asset(path, &path.with_extension("uexp"))?;
@@ -345,7 +490,8 @@ fn mod_issues(path: &Path, template: &TemplateShape) -> Result<ModIssues> {
     for row in &table.table.data {
         for (column, signatures) in row_shape(row) {
             for signature in signatures {
-                let (bucket, problem) = match template.exact.get(&column) {
+                let base = base_path(&column);
+                let (bucket, problem) = match table_shape.exact.get(&column) {
                     Some(expected) if expected.contains(&signature) => continue,
                     Some(expected) => (
                         &mut issues.lost,
@@ -354,19 +500,25 @@ fn mod_issues(path: &Path, template: &TemplateShape) -> Result<ModIssues> {
                             expected.iter().cloned().collect::<Vec<_>>().join("/")
                         ),
                     ),
-                    None => match template.by_base.get(&base_path(&column)) {
+                    None => match shapes.drifted_name(table_shape, &base, &signature) {
                         Some(current) => (
-                            &mut issues.lost,
-                            format!(
-                                "`{column}` was rebuilt in this version (now `{}`), so the \
-                                 mod's value is dropped",
-                                current.iter().cloned().collect::<Vec<_>>().join("/")
+                            &mut issues.drifted,
+                            format!("`{column}` is `{current}` in this version"),
+                        ),
+                        None => match table_shape.by_base.get(&base) {
+                            Some(current) => (
+                                &mut issues.lost,
+                                format!(
+                                    "`{column}` cannot be matched to `{}`, so the mod's value \
+                                     is dropped",
+                                    current.iter().cloned().collect::<Vec<_>>().join("/")
+                                ),
                             ),
-                        ),
-                        None => (
-                            &mut issues.ignored,
-                            format!("`{column}` no longer exists in this version"),
-                        ),
+                            None => (
+                                &mut issues.ignored,
+                                format!("`{column}` no longer exists in this version"),
+                            ),
+                        },
                     },
                 };
                 if seen.insert(problem.clone()) {
@@ -376,7 +528,7 @@ fn mod_issues(path: &Path, template: &TemplateShape) -> Result<ModIssues> {
         }
     }
 
-    for bucket in [&mut issues.lost, &mut issues.ignored] {
+    for bucket in [&mut issues.lost, &mut issues.drifted, &mut issues.ignored] {
         if bucket.len() > MAX_REPORTED {
             let extra = bucket.len() - MAX_REPORTED;
             bucket.truncate(MAX_REPORTED);
@@ -414,6 +566,11 @@ fn member_base(segment: &str) -> &str {
         }
         _ => rest,
     }
+}
+
+/// Final segment of a dotted column path: the member's own serialized name.
+fn last_segment(path: &str) -> &str {
+    path.rsplit('.').next().unwrap_or(path)
 }
 
 fn row_shape(row: &StructProperty) -> Shape {
@@ -475,56 +632,89 @@ fn type_signature(prop: &Property) -> String {
     }
 }
 
-/// Merge sources inside an unpacked mod pak: `*.uasset` named `_Foo.uasset` in
-/// a `datatables` directory.
+/// Every `*.uasset` in a `datatables` directory of an unpacked mod pak, merge
+/// source or not. `index_mod_files` sorts out which is which by name.
 fn find_datatable_uassets(dir: &Path) -> Vec<PathBuf> {
     crate::walk::files(dir, &mut |path| {
-        if !crate::walk::has_extension(path, "uasset") {
-            return false;
-        }
-        let in_datatables = path
-            .parent()
-            .and_then(|p| p.file_name())
-            .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("datatables"));
-        if !in_datatables {
-            return false;
-        }
-        // The mod side of a merge is named `_Foo.uasset` against the game's
-        // `Foo.uasset`. Without the underscore it is an asset-replacement file,
-        // not a merge source, which is worth saying out loud because it sits in
-        // exactly the right folder and does nothing.
-        let named_as_source = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with('_'));
-        if !named_as_source {
-            warn!("{path:?} is in a datatables folder but not named with a leading underscore, so it is not a merge source");
-        }
-        named_as_source
+        crate::walk::has_extension(path, "uasset")
+            && path
+                .parent()
+                .and_then(|p| p.file_name())
+                .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("datatables"))
     })
     .unwrap_or_default()
 }
 
-fn merge_one(template: &Path, mod_uassets: &[PathBuf]) -> Result<()> {
+/// Merge every source for one table into the staged template, in place.
+fn merge_one(template: &Path, sources: &[(String, PathBuf)], shapes: &GameShapes) -> Result<()> {
     let template_uexp = template.with_extension("uexp");
+    let stem = template
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file_label(template));
 
     let start = std::time::Instant::now();
     let mut main = open_asset(template, &template_uexp)?;
     let parsed = start.elapsed();
 
-    for mod_uasset in mod_uassets {
+    let mut renamed = 0usize;
+    // Row key -> the mod that last defined it, so a key arriving twice can be
+    // told apart: replacing one of the game's rows is what a translation or a
+    // rebalance mod is for, while two mods claiming one key means one of them
+    // silently loses its item.
+    let mut author: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut replaced: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut collisions: Vec<String> = Vec::new();
+
+    for (mod_name, mod_uasset) in sources {
         let mod_uexp = mod_uasset.with_extension("uexp");
         let mut modded = open_asset(mod_uasset, &mod_uexp)?;
-        merge_into(&mut main, &mut modded).with_context(|| format!("merging {mod_uasset:?}"))?;
+        let appended = merge_into(&mut main, &mut modded, shapes, shapes.tables.get(&stem))
+            .with_context(|| format!("merging {mod_uasset:?}"))?;
+        renamed += appended.renamed;
+        for key in appended.overridden {
+            match author.get(&key) {
+                Some(previous) => collisions.push(format!("{key:?} ({previous} then {mod_name})")),
+                None => *replaced.entry(mod_name).or_default() += 1,
+            }
+        }
+        for key in appended.keys {
+            author.insert(key, mod_name.clone());
+        }
     }
     let merged = start.elapsed();
 
     write_asset(&main, template, &template_uexp)?;
     let written = start.elapsed();
+
+    for (mod_name, count) in &replaced {
+        info!("{mod_name} redefines {count} of the game's own {stem} row(s)");
+    }
+    if !collisions.is_empty() {
+        const MAX_SHOWN: usize = 4;
+        warn!(
+            "{} {stem} row(s) claimed by more than one mod; the later definition wins: {}{}",
+            collisions.len(),
+            collisions
+                .iter()
+                .take(MAX_SHOWN)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            match collisions.len() > MAX_SHOWN {
+                true => format!(" and {} more", collisions.len() - MAX_SHOWN),
+                false => String::new(),
+            }
+        );
+    }
     info!(
-        "wrote merged {:?} ({} mod sources) parse={}ms merge={}ms write={}ms",
+        "wrote merged {:?} ({} mod sources{}) parse={}ms merge={}ms write={}ms",
         template,
-        mod_uassets.len(),
+        sources.len(),
+        match renamed {
+            0 => String::new(),
+            n => format!(", {n} drifted tag(s) rewritten"),
+        },
         parsed.as_millis(),
         (merged - parsed).as_millis(),
         (written - merged).as_millis()
@@ -564,10 +754,11 @@ fn write_asset(asset: &MemAsset, uasset: &Path, uexp: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Append `modded`'s rows into `main`'s DataTable.
+/// Append `modded`'s rows into `main`'s DataTable, returning how many drifted
+/// member tags had to be rewritten.
 ///
-/// Two things have to be translated on the way across, and both fail silently
-/// if missed:
+/// Three things have to be translated on the way across, and all three fail
+/// silently if missed:
 ///
 /// - **Names.** Every asset owns a name map, and an `FName` serializes as the
 ///   raw `(index, number)` pair it was parsed with, so a name carried over
@@ -580,12 +771,21 @@ fn write_asset(asset: &MemAsset, uasset: &Path, uexp: &Path) -> Result<()> {
 ///   re-added.
 /// - **Import references.** A `PackageIndex` is not a name, so it is outside
 ///   that traversal and is shifted here.
+/// - **Member tags.** A mod built against a rebuilt or hand-written struct
+///   carries a different `_<ordinal>_<GUID>` suffix for the same member, and the
+///   engine matches tags by that whole name. `remap_drift` rewrites those to the
+///   game's spelling; see [`GameShapes::drifted_name`] for when that is provable.
 ///
 /// `Asset::rebuild_name_map` does the name half in one call, but it walks the
 /// whole destination asset: on `list_props` that is 2477 rows and ~10k names
 /// re-examined per merged mod, measured at 6.9s of a 7.0s cold merge. Re-keying
 /// only what moved is proportional to the mod instead of to the game's table.
-fn merge_into(main: &mut MemAsset, modded: &mut MemAsset) -> Result<()> {
+fn merge_into(
+    main: &mut MemAsset,
+    modded: &mut MemAsset,
+    shapes: &GameShapes,
+    table_shape: Option<&TemplateShape>,
+) -> Result<Appended> {
     main.package_guid = modded.package_guid;
 
     let import_offset = main.imports.len() as i32;
@@ -625,28 +825,150 @@ fn merge_into(main: &mut MemAsset, modded: &mut MemAsset) -> Result<()> {
         )
         .ok_or_else(|| anyhow::anyhow!("template export not a DataTableExport"))?;
         // The engine's row map is keyed by name, so a repeated key means one of
-        // the two rows is unreachable. Deliberate when a mod replaces a vanilla
-        // item, a silent conflict when two mods pick the same key - either way
-        // the user needs it named, since the losing item simply won't exist.
+        // the two rows is unreachable. Which one is left for the caller to
+        // judge: it knows whether the row already there came from the game or
+        // from another mod.
         let existing: std::collections::HashSet<String> = main_export
             .table
             .data
             .iter()
             .map(|row| row.name.get_content())
             .collect();
+        let mut appended = Appended {
+            keys: Vec::with_capacity(row_count),
+            overridden: Vec::new(),
+            renamed: 0,
+        };
         for mut row in mod_rows {
             shift_row_refs(&mut row, import_offset);
+            if let Some(table_shape) = table_shape {
+                appended.renamed += remap_drift(&mut row.value, "", shapes, table_shape, &name_map);
+            }
             rekey_into(&mut row, &name_map);
             let key = row.name.get_content();
             if existing.contains(&key) {
-                warn!("row {key:?} already exists in this table; the later definition wins");
+                appended.overridden.push(key.clone());
             }
+            appended.keys.push(key);
             main_export.table.data.push(row);
         }
-    }
 
-    debug!("appended {row_count} rows, imports shifted by {import_offset}");
-    Ok(())
+        debug!("appended {row_count} rows, imports shifted by {import_offset}");
+        Ok(appended)
+    }
+}
+
+/// What one mod source contributed to a table.
+struct Appended {
+    /// Row keys the source defined, in order.
+    keys: Vec<String>,
+    /// Of those, the keys that were already in the table.
+    overridden: Vec<String>,
+    /// Member tags rewritten to the game's spelling.
+    renamed: usize,
+}
+
+/// Rewrite every member tag in `props` whose suffix drifted to the name the
+/// game's struct uses, returning how many were rewritten.
+///
+/// Mirrors `collect_shape`'s walk so the paths line up with the shape that was
+/// measured, and keys the lookup on *base* paths, which are suffix-free and so
+/// unaffected by drift in an enclosing struct's own name.
+///
+/// Container elements share their container's tag, so they are renamed with it:
+/// leaving them behind would write a tag the engine cannot match either.
+fn remap_drift(
+    props: &mut [Property],
+    base_prefix: &str,
+    shapes: &GameShapes,
+    table_shape: &TemplateShape,
+    name_map: &SharedResource<NameMap>,
+) -> usize {
+    let mut renamed = 0;
+    for prop in props.iter_mut() {
+        let name = prop.get_name().get_content();
+        let base = match base_prefix.is_empty() {
+            true => member_base(&name).to_string(),
+            false => format!("{base_prefix}.{}", member_base(&name)),
+        };
+
+        // `drifted_name` returning the mod's own spelling means the tag already
+        // matches, so the comparison is the whole test: no separate exact-path
+        // lookup is needed, and base paths stay valid however the enclosing
+        // struct's own suffix drifted.
+        // An empty struct array is left as authored: see `tag_is_rewritable`.
+        if tag_is_rewritable(prop) {
+            if let Some(current) = shapes.drifted_name(table_shape, &base, &type_signature(prop)) {
+                if current != name {
+                    let fixed = name_map.clone().get_mut().add_fname(current);
+                    rename_with_elements(prop, &name, &fixed);
+                    renamed += 1;
+                }
+            }
+        }
+
+        renamed += match prop {
+            Property::StructProperty(p) => {
+                remap_drift(&mut p.value, &base, shapes, table_shape, name_map)
+            }
+            Property::ArrayProperty(p) => {
+                remap_drift(&mut p.value, &base, shapes, table_shape, name_map)
+            }
+            Property::SetProperty(p) => {
+                remap_drift(&mut p.value.value, &base, shapes, table_shape, name_map)
+            }
+            _ => 0,
+        };
+    }
+    renamed
+}
+
+/// Set `prop`'s name everywhere the serializer will look for it.
+///
+/// A container's elements carry the container's tag, and `unreal_asset` writes a
+/// struct array's inner tag from its first element, then reads that tag back
+/// *over* the property's name. Renaming the elements keeps the two consistent.
+fn rename_with_elements(prop: &mut Property, old: &str, fixed: &FName) {
+    *prop.get_name_mut() = fixed.clone();
+    match prop {
+        Property::ArrayProperty(p) => rename_array(p, old, fixed),
+        Property::SetProperty(p) => {
+            rename_array(&mut p.value, old, fixed);
+            rename_array(&mut p.removed_items, old, fixed);
+        }
+        _ => {}
+    }
+}
+
+fn rename_array(array: &mut ArrayProperty, old: &str, fixed: &FName) {
+    if array.name.get_content() == old {
+        array.name = fixed.clone();
+    }
+    for element in &mut array.value {
+        if element.get_name().get_content() == old {
+            *element.get_name_mut() = fixed.clone();
+        }
+    }
+}
+
+/// Can this property's tag be rewritten consistently?
+///
+/// An empty struct array is the one case where it cannot: `unreal_asset` writes
+/// its inner tag from a private `dummy_property` there is no way to reach, and
+/// reads that tag back over the property's name, so a rename would produce a
+/// file that contradicts itself on the next read. Nothing is lost by leaving it:
+/// the array carries no elements, and a tag the engine cannot match leaves the
+/// member at its default, which for an array is empty either way.
+fn tag_is_rewritable(prop: &Property) -> bool {
+    match prop {
+        Property::ArrayProperty(p) => {
+            !p.value.is_empty()
+                || p.array_type
+                    .as_ref()
+                    .is_none_or(|t| t.get_content() != "StructProperty")
+        }
+        _ => true,
+    }
 }
 
 /// Re-point every `FName` in `container` that still belongs to a foreign name

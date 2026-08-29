@@ -1,5 +1,5 @@
-//! In-process port of Fusion's datatable/input merger, shipped as a
-//! shimloader overlay `ue4ss.dll` wrapper.
+//! ReFusion: an in-process port of Fusion's datatable/input merger, shipped as
+//! a shimloader overlay `ue4ss.dll` wrapper.
 //!
 //! The pipeline (`fuse`) and its building blocks are target-independent so they
 //! can be run and diffed natively; `win` holds the `DllMain` half.
@@ -26,7 +26,7 @@ const OUTPUT_PAK_NAME: &str = "FusionPatch_P.pak";
 const PROJECT_NAME: &str = "VotV";
 const MAIN_PAK_NAME: &str = "VotV-WindowsNoEditor.pak";
 const PAK_MOUNT: &str = "../../../VotV/";
-const CONFIG_NAME: &str = "FusionWrapper.ini";
+const CONFIG_NAME: &str = "ReFusion.ini";
 /// UE4SS mod folder of the C# Fusion, as r2modman installs it.
 const RIVAL_MOD_DIR: &str = "NynrahGhost-Fusion";
 
@@ -50,7 +50,7 @@ pub struct FuseOutcome {
     pub report_is_new: bool,
 }
 
-/// `<cfg_dir>/FusionWrapper.ini`. Absent means defaults.
+/// `<cfg_dir>/ReFusion.ini`. Absent means defaults.
 #[derive(Debug, Default)]
 struct Config {
     /// Which mods to merge even though they don't match the game's row structs.
@@ -118,7 +118,7 @@ pub fn left_out_report(outcome: &FuseOutcome) -> String {
     let mut body = unreadable_section(&outcome.unreadable_paks);
     body.push_str(&incompatible_section(&outcome.incompatible_mods));
     if !body.is_empty() {
-        body.push_str("Details are in fusion-wrapper-log.txt.");
+        body.push_str("Details are in refusion-log.txt.");
     }
     body
 }
@@ -189,7 +189,7 @@ fn incompatible_section(mods: &[datatable::IncompatibleMod]) -> String {
         body.push_str(
             "Skipped mods would have loaded items with no name, icon or mesh, so they were \
              left out; every other mod merged normally. Update or disable them.\n\n\
-             To keep one anyway, put its name in FusionWrapper.ini in the config folder:\n\
+             To keep one anyway, put its name in ReFusion.ini in the config folder:\n\
              merge_incompatible=ModName\n\n",
         );
     }
@@ -456,7 +456,7 @@ fn extract_templates(game_pak: &Path, staging: &Path) -> anyhow::Result<()> {
 struct ModContent {
     /// One unpacked directory per mod pak that had something to merge, paired
     /// with the pak's file stem: the name the user sees in the log and writes in
-    /// `FusionWrapper.ini`.
+    /// `ReFusion.ini`.
     dirs: Vec<(String, PathBuf)>,
     /// Stems of paks that could not be read at all. A different failure from a
     /// mod that merges badly: none of its rows ever reached the merge, so the
@@ -597,7 +597,7 @@ fn env_path(name: &str) -> Option<PathBuf> {
 
 /// Suffix appended to a rival merged pak. UE only mounts `*.pak`, so the
 /// renamed file is inert, stays visible, and is trivially reversible.
-const QUARANTINE_SUFFIX: &str = ".disabled-by-fusion-wrapper";
+const QUARANTINE_SUFFIX: &str = ".disabled-by-refusion";
 
 /// The paks under the user's pak directory, split by what they are.
 struct PakScan {
@@ -678,7 +678,7 @@ fn quarantine_rivals(rivals: &[PathBuf]) {
     }
 }
 
-/// Only `*DefaultInput.ini`, so our own `FusionWrapper.ini` in the same
+/// Only `*DefaultInput.ini`, so our own `ReFusion.ini` in the same
 /// directory is never swept into the input merge.
 fn list_cfgs(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(walk::files(dir, &mut |p| {
