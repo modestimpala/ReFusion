@@ -1,0 +1,3 @@
+Hides the C# Fusion mod from UE4SS so it cannot launch Fusion.exe alongside
+ReFusion. Shimloader applies this mask without modifying the user's profile;
+removing ReFusion restores the original mod.

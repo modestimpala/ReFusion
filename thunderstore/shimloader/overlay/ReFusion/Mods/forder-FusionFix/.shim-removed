@@ -1,0 +1,4 @@
+Hides FusionFix from UE4SS. ReFusion already handles profile paths and rebuilds
+when inputs change; FusionFix would instead launch a rival Fusion process and
+disable paks that ReFusion is meant to merge. Shimloader applies this mask
+without modifying the user's profile; removing ReFusion restores FusionFix.

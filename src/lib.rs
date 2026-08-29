@@ -27,8 +27,21 @@ const PROJECT_NAME: &str = "VotV";
 const MAIN_PAK_NAME: &str = "VotV-WindowsNoEditor.pak";
 const PAK_MOUNT: &str = "../../../VotV/";
 const CONFIG_NAME: &str = "ReFusion.ini";
-/// UE4SS mod folder of the C# Fusion, as r2modman installs it.
-const RIVAL_MOD_DIR: &str = "NynrahGhost-Fusion";
+/// UE4SS mod folders that drive the C# Fusion, as r2modman installs them.
+///
+/// Each ships a Lua script that runs before we could react to it, so the overlay
+/// masks the folders instead; see [`report_rival_tool`].
+const RIVAL_MOD_DIRS: &[(&str, &str)] = &[
+    (
+        "NynrahGhost-Fusion",
+        "launches Fusion.exe, which writes a rival merged pak",
+    ),
+    (
+        "forder-FusionFix",
+        "searches for Fusion.exe and launches it, and renames other mods' paks \
+         to .fusionfix-disabled when it decides they conflict over a datatable",
+    ),
+];
 
 /// What a run of the pipeline produced that the caller may want to surface.
 #[derive(Debug, Default)]
@@ -547,47 +560,46 @@ fn record_report(path: &Path, outcome: &FuseOutcome) -> bool {
     !body.is_empty()
 }
 
-/// Log whether the C# Fusion's UE4SS mod folder can still reach the game.
+/// Log whether each rival tool's UE4SS mod folder can still reach the game.
 ///
-/// The overlay package ships `Mods/<RIVAL_MOD_DIR>/.shim-removed`; shimloader
-/// turns that tombstone into a path mask on the logical
-/// `Binaries/Win64/Mods/<RIVAL_MOD_DIR>`, which its file detours check before
-/// any remap. UE4SS then never sees the folder, so the tool's `main.lua` never
-/// loads and never spawns `Fusion.exe`.
+/// The overlay package ships `Mods/<name>/.shim-removed` for every entry in
+/// [`RIVAL_MOD_DIRS`]; shimloader turns each tombstone into a path mask on the
+/// logical `Binaries/Win64/Mods/<name>`, which its file detours check before any
+/// remap. UE4SS then never sees the folder, so the mod's `main.lua` never loads.
 ///
-/// Shimming the exe itself would not work: `main.lua` recovers the *real*
-/// profile paths by parsing `shimloader-log.txt` and starts the process through
-/// `io.popen`, and shimloader hooks no process-creation API, so the child runs
-/// entirely outside the virtual file system.
+/// Masking the folder is the only point of control. Shimming `Fusion.exe` would
+/// not work: the scripts recover the *real* profile paths by parsing
+/// `shimloader-log.txt` and start the process through `io.popen` or `cmd.exe`,
+/// and shimloader hooks no process-creation API, so the child sees the physical
+/// file system. FusionFix goes further and searches for `Fusion.exe` by name
+/// rather than trusting a fixed folder, so hiding one package would not stop it.
 ///
-/// This can only be checked, not fixed, at runtime - shimloader scans the
-/// overlay before this DLL is loaded. Quarantining the merged pak afterwards
-/// stays the backstop for a tool that ran out-of-process anyway.
+/// This can only be checked, not fixed, at runtime: shimloader scans the overlay
+/// before this DLL is loaded. Quarantining the merged pak afterwards stays the
+/// backstop for a tool that ran out-of-process anyway, but it cannot undo a mod
+/// that FusionFix renamed out of the way.
 fn report_rival_tool(my_dir: &Path) {
     let Some(mod_dir) = env_path("SHIMLOADER_MOD_DIR") else {
         return;
     };
 
-    // Real profile path: masks are keyed on the logical path, so this answers
-    // "is it installed" regardless of masking.
-    if !mod_dir.join(RIVAL_MOD_DIR).is_dir() {
-        debug!("C# Fusion is not installed");
-        return;
-    }
+    for (name, effect) in RIVAL_MOD_DIRS {
+        // Real profile path: masks are keyed on the logical path, so this
+        // answers "is it installed" regardless of masking.
+        if !mod_dir.join(name).is_dir() {
+            debug!("{name} is not installed");
+            continue;
+        }
 
-    // Logical path: goes through the detours, so this answers "can the game
-    // still see it".
-    match my_dir.join("Mods").join(RIVAL_MOD_DIR).exists() {
-        false => info!(
-            "C# Fusion is installed but hidden from the game's Mods view, so its scripts \
-             cannot launch Fusion.exe"
-        ),
-        true => warn!(
-            "C# Fusion is installed and still visible to the game: its scripts will launch \
-             Fusion.exe and write a rival pak. The overlay package should ship \
-             Mods/{RIVAL_MOD_DIR}/.shim-removed to stop that; the rival pak gets \
-             quarantined either way"
-        ),
+        // Logical path: goes through the detours, so this answers "can the game
+        // still see it".
+        match my_dir.join("Mods").join(name).exists() {
+            false => info!("{name} is installed but hidden from the game's Mods view"),
+            true => warn!(
+                "{name} is installed and still visible to the game, where it {effect}. The \
+                 overlay package should ship Mods/{name}/.shim-removed to stop that"
+            ),
+        }
     }
 }
 

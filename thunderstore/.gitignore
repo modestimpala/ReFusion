@@ -1,0 +1,4 @@
+# Binaries are dropped in at package time, never committed:
+#   shimloader/overlay/ReFusion/ue4ss.dll
+#   shimloader/overlay/ReFusion/fusion/oo2core_9_win64.dll
+*.dll

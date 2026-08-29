@@ -49,12 +49,29 @@ normal path is Game Executable Launch -> Shimloader -> UE4SS -> Actual UE Game
 Initialization. We're inserted after shimloader and before UE4SS, so all pak
 operations finish before the game has any idea those paks even exist.
 
-### Visible compatibility failures
+### More reliable merging
 
 The original Fusion mod would silently fail on non-English paths and mods that
 no longer line up with the game's current structs. This version supports a wide
 variety of text encodings and visibly warns players about incompatible mods
 while continuing to merge the ones that do work.
+
+A test was ran through several real mod paks with both tools. ReFusion preserved
+all 220 mod-authored rows exactly as written and kept every vanilla row
+byte-identical. Of the 34 resulting tables, 29 were byte-identical to the C#
+output. The other five exposed real differences:
+
+- C# accidentally reduced `list_equipment` and `list_farmPlants` to structurally incorrect,
+  zero-row assets; ReFusion preserves all 35 and 61 rows.
+- C# mistakenly wrote the wrong nested struct reference in `list_lootTable` and shifted an
+  image reference in `list_achievements`; ReFusion preserved the authored
+  values.
+- C# skipped a 2471-row translation because its pak filename differed from its
+  internal mod folder; ReFusion resolves entries from the pak mount path instead.
+
+ReFusion also remaps struct members when their base name and serialized type
+identify one unambiguous game member. This deliberately handles GUID drift that
+the engine would otherwise drop.
 
 ### Less overhead and smaller paks
 
@@ -81,6 +98,8 @@ The wrapper is shipped as an overlay package.
     ├── ue4ss.dll                 (this repo's build output, renamed)
     ├── Mods/NynrahGhost-Fusion/
     │   └── .shim-removed         (masks the C# Fusion's Lua mod; see below)
+    ├── Mods/forder-FusionFix/
+    │   └── .shim-removed         (masks FusionFix's Lua mod; see below)
     └── fusion/
         └── oo2core_9_win64.dll   (Oodle runtime, see below)
 ```
@@ -105,38 +124,45 @@ And the launch params gain `--overlay-dir "<profile>/shimloader/overlay"` (set b
 
 ## Coexisting with the C# Fusion
 
-This is both a drop-in replacement for the C# Fusion and a standalone one. New
-mods can depend on this package alone, but many existing mods still depend on
-`NynrahGhost-Fusion`, so mod managers will often install both side by side.
-That is expected, not user error.
+ReFusion works both standalone and as a drop-in replacement. Many existing mods
+still depend on `NynrahGhost-Fusion`, so mod managers will often install both.
+That is expected.
 
 Both tools write a `FusionPatch_P.pak` containing the same entry paths. If both
-outputs mount, pak precedence decides which one wins, and a stale merge can
-silently replace the correct one. The wrapper prevents that at two points.
+mount, pak precedence decides which output wins and may silently select a stale
+merge. ReFusion prevents that two ways.
 
-**Upstream - stop the C# tool from running.** The overlay ships this empty
-marker:
+**Upstream - stop the other tools from running.** The overlay masks Lua
+mods with shimloader tombstones:
 
 ```
 shimloader/overlay/ReFusion/Mods/NynrahGhost-Fusion/.shim-removed
+shimloader/overlay/ReFusion/Mods/<other incompatible mod>/.shim-removed
 ```
 
-Shimloader treats `.shim-removed` as a tombstone, hiding the C# Fusion mod from
-UE4SS so its Lua launcher never runs. The real installation is untouched;
-removing this overlay makes it visible again. The marker must stay inside
-`Mods/NynrahGhost-Fusion` - placing it directly inside `Mods` would hide every
-user mod. `report_rival_tool` logs whether the C# tool is installed and whether
-the mask is working.
+UE4SS never sees those folders, but the real installations remain untouched and
+become visible again when ReFusion is removed. Each marker must remain inside
+its package folder; placing one directly in `Mods` would hide every user mod.
+
+FusionFix is masked as well because ReFusion already handles its useful parts:
+correct profile paths and cache invalidation when inputs change. Its remaining
+behavior renames paks to `.fusionfix-disabled` when they share a datatable,
+which would disable content ReFusion is designed to merge and make those paks
+invisible to it.
+
+The folders must be masked before UE4SS loads them. Replacing `Fusion.exe` would
+not work because the Lua scripts launch it outside shimloader's virtual
+filesystem, and FusionFix searches for it rather than using a fixed path.
 
 **Downstream - disable stale merged paks.** `pak::classify` identifies merged
 outputs by their contents rather than their filenames, then renames rivals to
 `*.pak.disabled-by-refusion`. The files remain visible and reversible but
 no longer mount.
 
-This only happens after our result is known good: after a successful write, on
-a valid cache hit, or when there is nothing to merge. If the merge fails, rival
-paks remain mounted because a stale merge is better than no merge. When the last
-mod is removed, our own output is deleted as well.
+This only happens after a successful write, a valid cache hit, or confirmation
+that there is nothing to merge. On failure, rival paks remain mounted because a
+stale merge is better than none. ReFusion also deletes its own output when the
+last mod is removed.
 
 To go back to the C# tool, remove the overlay wrapper and drop the
 `.disabled-by-refusion` suffix.
@@ -310,6 +336,31 @@ The six plain C Lua API exports are implemented by `src/lua_forward.rs` rather
 than forwarded statically. Any unsupported plain export produces a build
 warning.
 
+### Packaging
+
+`thunderstore/` contains the package layout, minus the gitignored wrapper and
+Oodle binaries:
+
+```
+thunderstore/
+├── manifest.json
+├── README.md
+├── CHANGELOG.md
+├── icon.png                                            (256x256, required by Thunderstore)
+└── shimloader/
+    ├── cfg/ReFusion.ini                                (documented defaults)
+    └── overlay/ReFusion/
+        ├── ue4ss.dll                                   <- target/x86_64-pc-windows-msvc/release/ue4ss.dll
+        ├── fusion/oo2core_9_win64.dll                  <- Oodle runtime, see above
+        └── Mods/
+            ├── NynrahGhost-Fusion/.shim-removed
+            └── forder-FusionFix/.shim-removed
+```
+
+Copy the built wrapper and Oodle runtime to the paths above, then zip the
+contents of `thunderstore/`, not the directory itself. Avoid unrelated root
+files: shimloader places them under its inert `mod/ReFusion/` directory.
+
 ## Offline verification
 
 The merge pipeline is cross-platform, so it can be tested without launching the
@@ -338,3 +389,16 @@ content testing. Both modify only the file provided.
 
 Feature parity with the C# Fusion for datatable and input merging. The unused
 `FuseActors` and `ReplacementMod` paths were intentionally not ported.
+
+## Credits
+
+- **[NynrahGhost](https://github.com/NynrahGhost)** — Creator of the OG [Fusion](https://thunderstore.io/c/voices-of-the-void/p/NynrahGhost/Fusion/), which still works today.
+    ReFusion wouldn't exist without it, and the original still remains an option.
+- **Icon mesh** — [“Ferris the crab”](https://skfb.ly/ovyv9) by tuxlu, licensed
+    under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Atom rings and background by me. 
+- **Core tooling** — Built on [repak](https://github.com/trumank/repak) for pak
+  I/O and [unreal_asset](https://crates.io/crates/unreal_asset) for cooked Unreal
+  assets.
+- **Loading infrastructure** — [unreal-shimloader](https://github.com/thunderstore-io/unreal-shimloader)
+  makes the in-process wrapper possible, and [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS)
+  remains the modding runtime ReFusion hands off to.

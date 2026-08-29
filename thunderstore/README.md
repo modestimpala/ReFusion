@@ -35,7 +35,7 @@ Keep the leading `_` on the table name—for example, `_list_props.uasset` and
 
 ## Credits
 
-- **[NynrahGhost](https://github.com/NynrahGhost)** — Creator of the [OG Fusion](https://thunderstore.io/c/voices-of-the-void/p/NynrahGhost/Fusion/), which still works today.
+- **[NynrahGhost](https://github.com/NynrahGhost)** — Creator of the OG [Fusion](https://thunderstore.io/c/voices-of-the-void/p/NynrahGhost/Fusion/), which still works today.
     ReFusion wouldn't exist without it, and the original still remains an option.
 - **Icon mesh** — [“Ferris the crab”](https://skfb.ly/ovyv9) by tuxlu, licensed
     under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Atom rings and background by me. 
