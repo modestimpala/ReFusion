@@ -229,6 +229,7 @@ pub fn fuse(my_dir: &Path) -> anyhow::Result<FuseOutcome> {
     report_rival_tool(my_dir);
 
     let layout = Layout::new(my_dir, &pak_dir)?;
+    let _scratch = ScratchCleanup(&layout.work);
     let scan = scan_paks(&pak_dir, &layout.output_pak)?;
     let config_path = cfg_dir.join(CONFIG_NAME);
     let config = Config::load(&config_path);
@@ -337,6 +338,26 @@ pub fn fuse(my_dir: &Path) -> anyhow::Result<FuseOutcome> {
     Ok(outcome)
 }
 
+/// Deletes the scratch tree however `fuse` exits, including the cache-hit path
+/// so a tree left by an older version or an interrupted run goes too.
+///
+/// It sits under the game's `Binaries/Win64`, where UE4SS's
+/// `IterateGameDirectories` walks it. Extracted paks reach about 14 levels below
+/// the game root, and UE4SS releases without UE4SS-RE/RE-UE4SS#1374 overrun the
+/// Lua stack on a tree that deep and corrupt the heap. Nothing reads the tree
+/// after packing: the merge cache lives in `last-write.txt`.
+struct ScratchCleanup<'a>(&'a Path);
+
+impl Drop for ScratchCleanup<'_> {
+    fn drop(&mut self) {
+        match std::fs::remove_dir_all(self.0) {
+            Ok(()) => info!("removed scratch tree {:?}", self.0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("could not remove scratch tree {:?}: {e}", self.0),
+        }
+    }
+}
+
 /// Every path the pipeline reads or writes, derived from the two directories
 /// shimloader hands us.
 ///
@@ -346,7 +367,7 @@ pub fn fuse(my_dir: &Path) -> anyhow::Result<FuseOutcome> {
 struct Layout {
     /// The game's own pak: the templates every merge starts from.
     game_pak: PathBuf,
-    /// Scratch tree, recreated per merge.
+    /// Scratch tree, recreated per merge and deleted when `fuse` returns.
     work: PathBuf,
     /// Templates being merged, and the tree that gets packed.
     staging: PathBuf,

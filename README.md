@@ -116,7 +116,7 @@ game directory:
 ├── oo2core_9_win64.dll           (placed from the overlay copy, where repak looks)
 ├── refusion-log.txt
 └── fusion/
-    ├── work/                     (extracted paks + merge staging)
+    ├── work/                     (merge scratch, deleted once the merge finishes)
     └── last-write.txt            (input mtimes, skips redundant merges)
 ```
 

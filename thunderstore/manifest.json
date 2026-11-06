@@ -1,6 +1,6 @@
 {
     "name": "ReFusion",
-    "version_number": "1.0.0",
+    "version_number": "1.0.1",
     "website_url": "https://github.com/modestimpala/ReFusion/",
     "description": "A fast, native drop-in replacement for Fusion's datatable and input merging.",
     "dependencies": [

@@ -1,10 +1,12 @@
 # ReFusion
 
-<div align="center">
-    <img src="./icon_full.png" alt="Project Screenshot" width="200">
-</div>
+<p align="center" width="100%">
+    <img src="https://raw.githubusercontent.com/modestimpala/ReFusion/refs/heads/main/thunderstore/icon_full.png" width="200">
+</p>
 
 An in-process reimplementation of NynrahGhost's Fusion with faster merging, smaller output, compatibility validation, and full Unicode path support. Benchmarked around 4-11x faster, with an 82% smaller output pak.
+
+This mod works with the original Fusion mod installed. It just disables it!
 
 ## Mod users
 
@@ -30,7 +32,7 @@ For datatables, pack the `.uasset` and `.uexp` under:
 <Project>/Content/Mods/<YourMod>/_Content/main/datatables/_<table>.*
 ```
 
-Keep the leading `_` on the table name—for example, `_list_props.uasset` and
+Keep the leading `_` on the table name - for example, `_list_props.uasset` and
 `_list_props.uexp`. Pack `DefaultInput.ini` normally for input merging.
 
 ## Credits
